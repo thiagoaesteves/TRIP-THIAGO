@@ -1,4 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'http';
+import dotenv from 'dotenv';
+import fs from 'fs';
 import {
   AIRPORTS,
   INITIAL_ALERTS,
@@ -9,6 +11,12 @@ import {
   resolveAirport,
   scanFlightsForRoute,
 } from '../data/flightEngine';
+
+// Ensure environment variables are loaded
+dotenv.config();
+if (!process.env.DUFFEL_API_KEY && fs.existsSync('.env.example')) {
+  dotenv.config({ path: '.env.example' });
+}
 
 let savedAlerts: RouteAlert[] = [...INITIAL_ALERTS];
 
@@ -30,8 +38,11 @@ async function fetchDuffelOffers(
   destCode: string,
   dateStr: string,
   passengersCount: number
-): Promise<FlightOffer[] | null> {
+): Promise<{ flights: FlightOffer[]; rawData: any } | null> {
   const duffelApiKey = process.env.DUFFEL_API_KEY;
+  if (!duffelApiKey || duffelApiKey === 'duffel_test_...') {
+    return null;
+  }
 
   try {
     const passengers = Array.from({ length: Math.max(1, passengersCount) }, () => ({
@@ -62,6 +73,7 @@ async function fetchDuffelOffers(
     });
 
     if (!response.ok) {
+      console.warn('Duffel API returned status:', response.status);
       return null;
     }
 
@@ -74,7 +86,7 @@ async function fetchDuffelOffers(
     const origObj = resolveAirport(originCode);
     const destObj = resolveAirport(destCode);
 
-    return rawOffers.slice(0, 10).map((off: any, idx: number) => {
+    const flights: FlightOffer[] = rawOffers.slice(0, 15).map((off: any, idx: number) => {
       const firstSlice = off.slices?.[0];
       const segments = firstSlice?.segments || [];
       const firstSeg = segments[0] || {};
@@ -96,12 +108,17 @@ async function fetchDuffelOffers(
 
       const rawAmount = parseFloat(off.total_amount) || 120;
       const currency = off.total_currency || 'BRL';
+      // Taxa de câmbio para exibir em Reais quando a Duffel retornar em EUR ou USD
       const exchangeRate = currency === 'EUR' ? 6.15 : currency === 'USD' ? 5.65 : 1.0;
       const priceBrl = Math.round(rawAmount * exchangeRate * 100) / 100;
 
       const airlineName = off.owner?.name || 'Companhia Aérea';
+      const rawAirlineCode = off.owner?.iata_code || firstSeg.operating_carrier?.iata_code || 'LA';
+      const validAirlineCodes = ['LA', 'G3', 'AD', 'TP', 'AA'];
+      const airlineCode = validAirlineCodes.includes(rawAirlineCode) ? rawAirlineCode : 'LA';
+
       const flightNum = firstSeg.marketing_carrier_flight_number
-        ? `${firstSeg.operating_carrier?.iata_code || 'DF'} ${firstSeg.marketing_carrier_flight_number}`
+        ? `${rawAirlineCode} ${firstSeg.marketing_carrier_flight_number}`
         : `VOO ${1000 + idx * 42}`;
 
       const boardingTax = 54.65 * Math.max(1, passengersCount);
@@ -113,12 +130,14 @@ async function fetchDuffelOffers(
         price: Math.round(priceBrl * (1 + (((dIdx * 7) % 15) - 5) / 100)),
       }));
 
+      const aircraftName = firstSeg.aircraft?.name || 'Airbus A320 / Boeing 737';
+
       return {
         id: off.id || `duffel-${idx}`,
-        source: 'Duffel Global GDS (Ao Vivo)',
+        source: 'Duffel API (Ao Vivo)',
         sourceType: 'cia',
         airline: airlineName,
-        airlineCode: (firstSeg.operating_carrier?.iata_code as any) || 'LA',
+        airlineCode: airlineCode as any,
         flightNumber: flightNum,
         originCode: origObj.code,
         originCity: origObj.city,
@@ -141,18 +160,21 @@ async function fetchDuffelOffers(
         recommendedStrategy: 'Dinheiro',
         strategySavings: 15.0,
         baggage: '1 item pessoal + mala de mão inclusa',
-        aircraft: firstSeg.aircraft?.name || 'Aeronave Comercial',
-        fareClass: 'Econômica Regular',
+        aircraft: aircraftName,
+        fareClass: 'Econômica',
         refundable: false,
         historicalAvgPrice: Math.round(priceBrl * 1.18),
         discountPercent: 15,
-        seatsLeft: 4,
-        verifiedAt: 'Ao vivo via Duffel API',
+        seatsLeft: 5,
+        verifiedAt: `Ao vivo · Duffel GDS (${off.id.slice(0, 14)}...)`,
         link: `https://www.google.com/travel/flights?q=Flights%20to%20${destObj.code}%20from%20${origObj.code}%20on%20${dateStr}%20oneway&curr=BRL&hl=pt-BR`,
         priceHistory7d,
       };
     });
-  } catch {
+
+    return { flights, rawData: json.data };
+  } catch (err) {
+    console.error('Erro ao consultar Duffel API:', err);
     return null;
   }
 }
@@ -194,10 +216,17 @@ export async function handleApiRequest(
 
   // GET /api/flights/search
   if (pathName === '/api/flights/search' && req.method === 'GET') {
-    const origin = query.get('origin') || 'CWB';
-    const destination = query.get('destination') || 'GIG';
+    const rawOrigin = query.get('origin') || 'CWB';
+    const rawDestination = query.get('destination') || 'GIG';
     const date = query.get('date') || '2026-11-20';
+    const originAirport = resolveAirport(rawOrigin);
+    const destinationAirport = resolveAirport(rawDestination);
+
     const duffelApiKey = process.env.DUFFEL_API_KEY;
+
+    if (!duffelApiKey || duffelApiKey === 'duffel_test_...') {
+      return sendJson(res, 400, { error: 'Chave da API da Duffel não configurada no .env.' });
+    }
 
     try {
       const duffelResponse = await fetch('https://api.duffel.com/air/offer_requests', {
@@ -212,8 +241,8 @@ export async function handleApiRequest(
           data: {
             slices: [
               {
-                origin,
-                destination,
+                origin: originAirport.code,
+                destination: destinationAirport.code,
                 departure_date: date,
               },
             ],
@@ -226,12 +255,12 @@ export async function handleApiRequest(
       const flightData = await duffelResponse.json();
       sendJson(res, duffelResponse.status, flightData);
     } catch {
-      sendJson(res, 500, { error: 'Erro ao processar busca de voos reais.' });
+      sendJson(res, 500, { error: 'Erro ao processar busca de voos reais na Duffel.' });
     }
     return;
   }
 
-  // POST /api/search
+  // POST /api/search (Chamada principal feita pelo botão "Varrer")
   if (pathName === '/api/search' && req.method === 'POST') {
     const body = await parseBody(req);
     const { origin = 'CWB', destination = 'GIG', date, passengers = 1 } = body;
@@ -239,11 +268,15 @@ export async function handleApiRequest(
       date || new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0];
     const pax = Math.max(1, Math.min(9, Number(passengers) || 1));
 
+    // Resolve sempre para o aeroporto correto (trata "Curitiba (CWB)" -> "CWB")
     const originAirport = resolveAirport(String(origin));
     const destinationAirport = resolveAirport(String(destination));
 
     let flights: FlightOffer[] = [];
-    const duffelFlights = await fetchDuffelOffers(
+    let duffelRawData: any = null;
+    let isLiveDuffel = false;
+
+    const duffelResult = await fetchDuffelOffers(
       originAirport.code,
       destinationAirport.code,
       searchDate,
@@ -257,9 +290,12 @@ export async function handleApiRequest(
       pax
     );
 
-    if (duffelFlights && duffelFlights.length > 0) {
+    if (duffelResult && duffelResult.flights.length > 0) {
+      isLiveDuffel = true;
+      duffelRawData = duffelResult.rawData;
+      // Mescla as ofertas reais da Duffel com as cotações de milhas locais
       const milesOffers = localOffers.filter((o) => o.sourceType === 'milhas');
-      flights = [...duffelFlights.slice(0, 5), ...milesOffers].sort((a, b) => a.price - b.price);
+      flights = [...duffelResult.flights, ...milesOffers].sort((a, b) => a.price - b.price);
     } else {
       flights = localOffers;
     }
@@ -278,8 +314,10 @@ export async function handleApiRequest(
       passengers: pax,
       flights,
       calendar,
+      isLiveDuffel,
+      duffelOffers: duffelRawData || {},
       scannedSources: [
-        'Duffel GDS Ao Vivo',
+        'Duffel Global GDS (Ao Vivo)',
         'LATAM Direto',
         'GOL / Smiles',
         'Azul / TudoAzul',

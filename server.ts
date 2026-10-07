@@ -1,82 +1,57 @@
 import express from 'express';
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createServer as createViteServer } from 'vite';
+import { handleApiRequest } from './src/server/apiHandler';
 
 dotenv.config();
 
-const app = express();
-app.use(express.json());
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// 1. Rota de busca principal que o front-end chama (/api/search)
-app.post('/api/search', async (req, res) => {
-  try {
-    const { origin, destination, date } = req.body;
-    const duffelApiKey = process.env.DUFFEL_API_KEY;
+async function startServer() {
+  const app = express();
 
-    const originAirport = { code: origin || 'CWB', city: 'Curitiba', name: 'Afonso Pena', state: 'PR', country: 'Brasil' };
-    const destinationAirport = { code: destination || 'GIG', city: 'Rio de Janeiro', name: 'Galeão', state: 'RJ', country: 'Brasil' };
+  const portArgIndex = process.argv.indexOf('--port');
+  const cliPort = portArgIndex !== -1 ? Number(process.argv[portArgIndex + 1]) : null;
+  const PORT = cliPort || 3000;
 
-    if (!duffelApiKey) {
-      return res.json({
-        originAirport,
-        destinationAirport,
-        offers: []
-      });
+  const hostArgIndex = process.argv.indexOf('--host');
+  const cliHost = hostArgIndex !== -1 ? process.argv[hostArgIndex + 1] : null;
+  const HOST = cliHost || '0.0.0.0';
+
+  app.use(express.json());
+
+  // Roteia todas as chamadas de API (/api/*) através do handler centralizado com Duffel
+  app.use(async (req, res, next) => {
+    if (req.url.startsWith('/api')) {
+      await handleApiRequest(req, res, next);
+    } else {
+      next();
     }
+  });
 
-    // Chamada real à API da Duffel
-    const duffelResponse = await fetch('https://api.duffel.com/air/offer_requests', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${duffelApiKey}`,
-        'Duffel-Version': 'v2',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: false,
       },
-      body: JSON.stringify({
-        data: {
-          slices: [
-            {
-              origin: origin || 'CWB',
-              destination: destination || 'GIG',
-              departure_date: date || '2026-11-20'
-            }
-          ],
-          passengers: [{ type: 'adult' }],
-          cabin_class: 'economy'
-        }
-      })
+      appType: 'spa',
     });
-
-    const flightData = await duffelResponse.json();
-
-    if (!duffelResponse.ok) {
-      console.error('Erro na Duffel API:', flightData);
-      return res.status(duffelResponse.status).json(flightData);
-    }
-
-    // Retorna no formato que o Garimpa Trip espera
-    res.json({
-      originAirport,
-      destinationAirport,
-      duffelOffers: flightData.data || {}
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(__dirname, 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
     });
-
-  } catch (error) {
-    console.error('Erro interno em /api/search:', error);
-    res.status(500).json({ error: 'Erro ao processar busca de voos.' });
   }
-});
 
-// 2. Rota de suporte para alertas (evita o erro 404 no console)
-app.get('/api/alerts', (req, res) => {
-  res.json({ alerts: [] });
-});
+  app.listen(PORT, HOST, () => {
+    console.log(`Servidor do FlyPrice Tracker a rodar em http://${HOST}:${PORT}`);
+  });
+}
 
-app.post('/api/alerts', (req, res) => {
-  res.json({ success: true, message: 'Alerta registado com sucesso.' });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(Number(PORT), '0.0.0.0', () => {
-  console.log(`Servidor do Garimpa Trip a rodar na porta ${PORT}`);
-});
+startServer();
