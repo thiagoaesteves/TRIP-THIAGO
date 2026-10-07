@@ -1,9 +1,4 @@
-import express from 'express';
-import dotenv from 'dotenv';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
+import type { IncomingMessage, ServerResponse } from 'http';
 import {
   AIRPORTS,
   INITIAL_ALERTS,
@@ -13,16 +8,9 @@ import {
   normalizeText,
   resolveAirport,
   scanFlightsForRoute,
-} from './src/data/flightEngine';
+} from '../data/flightEngine';
 
-// Load .env or fallback to .env.example
-dotenv.config();
-if (!process.env.DUFFEL_API_KEY && fs.existsSync('.env.example')) {
-  dotenv.config({ path: '.env.example' });
-}
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+let savedAlerts: RouteAlert[] = [...INITIAL_ALERTS];
 
 function parseIsoDuration(dur: string): { label: string; minutes: number } {
   if (!dur) return { label: '1h 30m', minutes: 90 };
@@ -44,7 +32,6 @@ async function fetchDuffelOffers(
   passengersCount: number
 ): Promise<FlightOffer[] | null> {
   const duffelApiKey = process.env.DUFFEL_API_KEY;
-  if (!duffelApiKey) return null;
 
   try {
     const passengers = Array.from({ length: Math.max(1, passengersCount) }, () => ({
@@ -75,7 +62,6 @@ async function fetchDuffelOffers(
     });
 
     if (!response.ok) {
-      console.warn('Duffel API returned status:', response.status);
       return null;
     }
 
@@ -110,7 +96,6 @@ async function fetchDuffelOffers(
 
       const rawAmount = parseFloat(off.total_amount) || 120;
       const currency = off.total_currency || 'BRL';
-      // Normalize currency to BRL for display in Brazilian market
       const exchangeRate = currency === 'EUR' ? 6.15 : currency === 'USD' ? 5.65 : 1.0;
       const priceBrl = Math.round(rawAmount * exchangeRate * 100) / 100;
 
@@ -125,7 +110,7 @@ async function fetchDuffelOffers(
       const dayLabels = ['D-6', 'D-5', 'D-4', 'D-3', 'D-2', 'Ontem', 'Hoje'];
       const priceHistory7d = dayLabels.map((dLabel, dIdx) => ({
         day: dLabel,
-        price: Math.round(priceBrl * (1 + ((dIdx * 7) % 15 - 5) / 100)),
+        price: Math.round(priceBrl * (1 + (((dIdx * 7) % 15) - 5) / 100)),
       }));
 
       return {
@@ -167,37 +152,54 @@ async function fetchDuffelOffers(
         priceHistory7d,
       };
     });
-  } catch (err) {
-    console.error('Erro ao consultar Duffel API:', err);
+  } catch {
     return null;
   }
 }
 
-async function startServer() {
-  const app = express();
-
-  const portArgIndex = process.argv.indexOf('--port');
-  const cliPort = portArgIndex !== -1 ? Number(process.argv[portArgIndex + 1]) : null;
-  const PORT = cliPort || 3000;
-
-  const hostArgIndex = process.argv.indexOf('--host');
-  const cliHost = hostArgIndex !== -1 ? process.argv[hostArgIndex + 1] : null;
-  const HOST = cliHost || '0.0.0.0';
-
-  app.use(express.json());
-
-  let savedAlerts: RouteAlert[] = [...INITIAL_ALERTS];
-
-  // Rota de busca de voos reais da Duffel API
-  app.get('/api/flights/search', async (req, res) => {
-    try {
-      const { origin = 'CWB', destination = 'GIG', date } = req.query;
-      const duffelApiKey = process.env.DUFFEL_API_KEY;
-
-      if (!duffelApiKey) {
-        return res.status(500).json({ error: 'Chave da API da Duffel não configurada.' });
+function parseBody(req: IncomingMessage): Promise<any> {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch {
+        resolve({});
       }
+    });
+  });
+}
 
+function sendJson(res: ServerResponse, status: number, data: any) {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify(data));
+}
+
+export async function handleApiRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  next: () => void
+): Promise<void> {
+  const url = req.url || '';
+  if (!url.startsWith('/api')) {
+    return next();
+  }
+
+  const [pathName, queryString] = url.split('?');
+  const query = new URLSearchParams(queryString || '');
+
+  // GET /api/flights/search
+  if (pathName === '/api/flights/search' && req.method === 'GET') {
+    const origin = query.get('origin') || 'CWB';
+    const destination = query.get('destination') || 'GIG';
+    const date = query.get('date') || '2026-11-20';
+    const duffelApiKey = process.env.DUFFEL_API_KEY;
+
+    try {
       const duffelResponse = await fetch('https://api.duffel.com/air/offer_requests', {
         method: 'POST',
         headers: {
@@ -210,9 +212,9 @@ async function startServer() {
           data: {
             slices: [
               {
-                origin: String(origin),
-                destination: String(destination),
-                departure_date: String(date || '2026-11-20'),
+                origin,
+                destination,
+                departure_date: date,
               },
             ],
             passengers: [{ type: 'adult' }],
@@ -222,22 +224,17 @@ async function startServer() {
       });
 
       const flightData = await duffelResponse.json();
-
-      if (!duffelResponse.ok) {
-        console.error('Erro na API da Duffel:', flightData);
-        return res.status(duffelResponse.status).json(flightData);
-      }
-
-      res.json(flightData);
-    } catch (error) {
-      console.error('Erro interno na busca da Duffel:', error);
-      res.status(500).json({ error: 'Erro ao processar busca de voos reais.' });
+      sendJson(res, duffelResponse.status, flightData);
+    } catch {
+      sendJson(res, 500, { error: 'Erro ao processar busca de voos reais.' });
     }
-  });
+    return;
+  }
 
-  // Rota principal do comparador com Duffel ao vivo + radar de milhas
-  app.post('/api/search', async (req, res) => {
-    const { origin = 'CWB', destination = 'GIG', date, passengers = 1 } = req.body || {};
+  // POST /api/search
+  if (pathName === '/api/search' && req.method === 'POST') {
+    const body = await parseBody(req);
+    const { origin = 'CWB', destination = 'GIG', date, passengers = 1 } = body;
     const searchDate =
       date || new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0];
     const pax = Math.max(1, Math.min(9, Number(passengers) || 1));
@@ -261,7 +258,6 @@ async function startServer() {
     );
 
     if (duffelFlights && duffelFlights.length > 0) {
-      // Mescla as ofertas ao vivo da Duffel com as cotações de milhas locais
       const milesOffers = localOffers.filter((o) => o.sourceType === 'milhas');
       flights = [...duffelFlights.slice(0, 5), ...milesOffers].sort((a, b) => a.price - b.price);
     } else {
@@ -275,7 +271,7 @@ async function startServer() {
       pax
     );
 
-    res.json({
+    sendJson(res, 200, {
       originAirport,
       destinationAirport,
       date: searchDate,
@@ -292,12 +288,14 @@ async function startServer() {
         'Skyscanner',
       ],
     });
-  });
+    return;
+  }
 
-  app.get('/api/airports', (req, res) => {
-    const q = normalizeText(String(req.query.q || ''));
+  // GET /api/airports
+  if (pathName === '/api/airports' && req.method === 'GET') {
+    const q = normalizeText(query.get('q') || '');
     if (!q) {
-      res.json(AIRPORTS);
+      sendJson(res, 200, AIRPORTS);
       return;
     }
     const matches = AIRPORTS.filter(
@@ -307,15 +305,20 @@ async function startServer() {
         normalizeText(a.name).includes(q) ||
         normalizeText(a.state).includes(q)
     );
-    res.json(matches);
-  });
+    sendJson(res, 200, matches);
+    return;
+  }
 
-  app.get('/api/alerts', (_req, res) => {
-    res.json(savedAlerts);
-  });
+  // GET /api/alerts
+  if (pathName === '/api/alerts' && req.method === 'GET') {
+    sendJson(res, 200, savedAlerts);
+    return;
+  }
 
-  app.post('/api/alerts', (req, res) => {
-    const { origin, destination, date, targetPrice } = req.body || {};
+  // POST /api/alerts
+  if (pathName === '/api/alerts' && req.method === 'POST') {
+    const body = await parseBody(req);
+    const { origin, destination, date, targetPrice } = body;
     const orig = resolveAirport(String(origin || 'CWB'));
     const dest = resolveAirport(String(destination || 'GIG'));
     const flightDate =
@@ -340,34 +343,17 @@ async function startServer() {
     };
 
     savedAlerts = [newAlert, ...savedAlerts];
-    res.status(201).json(newAlert);
-  });
-
-  app.delete('/api/alerts/:id', (req, res) => {
-    savedAlerts = savedAlerts.filter((a) => a.id !== req.params.id);
-    res.json({ ok: true });
-  });
-
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: false,
-      },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    sendJson(res, 201, newAlert);
+    return;
   }
 
-  app.listen(PORT, HOST, () => {
-    console.log(`Servidor do FlyPrice Tracker a rodar em http://${HOST}:${PORT}`);
-  });
-}
+  // DELETE /api/alerts/:id
+  if (pathName.startsWith('/api/alerts/') && req.method === 'DELETE') {
+    const id = pathName.replace('/api/alerts/', '');
+    savedAlerts = savedAlerts.filter((a) => a.id !== id);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
 
-startServer();
+  next();
+}
