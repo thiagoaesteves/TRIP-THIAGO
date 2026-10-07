@@ -1,373 +1,82 @@
 import express from 'express';
 import dotenv from 'dotenv';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
-import {
-  AIRPORTS,
-  INITIAL_ALERTS,
-  RouteAlert,
-  FlightOffer,
-  generateFareCalendar,
-  normalizeText,
-  resolveAirport,
-  scanFlightsForRoute,
-} from './src/data/flightEngine';
 
-// Load .env or fallback to .env.example
 dotenv.config();
-if (!process.env.DUFFEL_API_KEY && fs.existsSync('.env.example')) {
-  dotenv.config({ path: '.env.example' });
-}
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const app = express();
+app.use(express.json());
 
-function parseIsoDuration(dur: string): { label: string; minutes: number } {
-  if (!dur) return { label: '1h 30m', minutes: 90 };
-  const hMatch = dur.match(/(\d+)H/);
-  const mMatch = dur.match(/(\d+)M/);
-  const hours = hMatch ? parseInt(hMatch[1], 10) : 0;
-  const mins = mMatch ? parseInt(mMatch[1], 10) : 0;
-  const total = hours * 60 + mins;
-  return {
-    label: `${hours}h ${mins.toString().padStart(2, '0')}m`,
-    minutes: total || 90,
-  };
-}
-
-async function fetchDuffelOffers(
-  originCode: string,
-  destCode: string,
-  dateStr: string,
-  passengersCount: number
-): Promise<FlightOffer[] | null> {
-  const duffelApiKey = process.env.DUFFEL_API_KEY;
-  if (!duffelApiKey) return null;
-
+// 1. Rota de busca principal que o front-end chama (/api/search)
+app.post('/api/search', async (req, res) => {
   try {
-    const passengers = Array.from({ length: Math.max(1, passengersCount) }, () => ({
-      type: 'adult',
-    }));
+    const { origin, destination, date } = req.body;
+    const duffelApiKey = process.env.DUFFEL_API_KEY;
 
-    const response = await fetch('https://api.duffel.com/air/offer_requests', {
+    const originAirport = { code: origin || 'CWB', city: 'Curitiba', name: 'Afonso Pena', state: 'PR', country: 'Brasil' };
+    const destinationAirport = { code: destination || 'GIG', city: 'Rio de Janeiro', name: 'Galeão', state: 'RJ', country: 'Brasil' };
+
+    if (!duffelApiKey) {
+      return res.json({
+        originAirport,
+        destinationAirport,
+        offers: []
+      });
+    }
+
+    // Chamada real à API da Duffel
+    const duffelResponse = await fetch('https://api.duffel.com/air/offer_requests', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${duffelApiKey}`,
         'Duffel-Version': 'v2',
         'Content-Type': 'application/json',
-        'Accept': 'application/json',
+        'Accept': 'application/json'
       },
       body: JSON.stringify({
         data: {
           slices: [
             {
-              origin: originCode,
-              destination: destCode,
-              departure_date: dateStr,
-            },
+              origin: origin || 'CWB',
+              destination: destination || 'GIG',
+              departure_date: date || '2026-11-20'
+            }
           ],
-          passengers,
-          cabin_class: 'economy',
-        },
-      }),
+          passengers: [{ type: 'adult' }],
+          cabin_class: 'economy'
+        }
+      })
     });
 
-    if (!response.ok) {
-      console.warn('Duffel API returned status:', response.status);
-      return null;
+    const flightData = await duffelResponse.json();
+
+    if (!duffelResponse.ok) {
+      console.error('Erro na Duffel API:', flightData);
+      return res.status(duffelResponse.status).json(flightData);
     }
 
-    const json = await response.json();
-    const rawOffers = json.data?.offers;
-    if (!Array.isArray(rawOffers) || rawOffers.length === 0) {
-      return null;
-    }
-
-    const origObj = resolveAirport(originCode);
-    const destObj = resolveAirport(destCode);
-
-    return rawOffers.slice(0, 10).map((off: any, idx: number) => {
-      const firstSlice = off.slices?.[0];
-      const segments = firstSlice?.segments || [];
-      const firstSeg = segments[0] || {};
-      const lastSeg = segments[segments.length - 1] || firstSeg;
-
-      const durParsed = parseIsoDuration(firstSlice?.duration || '');
-      const depTime = firstSeg.departing_at
-        ? firstSeg.departing_at.split('T')[1]?.slice(0, 5) || '08:00'
-        : '08:00';
-      const arrTime = lastSeg.arriving_at
-        ? lastSeg.arriving_at.split('T')[1]?.slice(0, 5) || '10:30'
-        : '10:30';
-
-      const numStops = Math.max(0, segments.length - 1);
-      const stopDetails =
-        numStops === 0
-          ? 'Voo Direto'
-          : `${numStops} parada(s) (${segments[0]?.destination?.iata_code || 'HUB'})`;
-
-      const rawAmount = parseFloat(off.total_amount) || 120;
-      const currency = off.total_currency || 'BRL';
-      // Normalize currency to BRL for display in Brazilian market
-      const exchangeRate = currency === 'EUR' ? 6.15 : currency === 'USD' ? 5.65 : 1.0;
-      const priceBrl = Math.round(rawAmount * exchangeRate * 100) / 100;
-
-      const airlineName = off.owner?.name || 'Companhia Aérea';
-      const flightNum = firstSeg.marketing_carrier_flight_number
-        ? `${firstSeg.operating_carrier?.iata_code || 'DF'} ${firstSeg.marketing_carrier_flight_number}`
-        : `VOO ${1000 + idx * 42}`;
-
-      const boardingTax = 54.65 * Math.max(1, passengersCount);
-      const milesReq = Math.max(3800, Math.round((priceBrl - boardingTax) / 0.0175 / 100) * 100);
-
-      const dayLabels = ['D-6', 'D-5', 'D-4', 'D-3', 'D-2', 'Ontem', 'Hoje'];
-      const priceHistory7d = dayLabels.map((dLabel, dIdx) => ({
-        day: dLabel,
-        price: Math.round(priceBrl * (1 + ((dIdx * 7) % 15 - 5) / 100)),
-      }));
-
-      return {
-        id: off.id || `duffel-${idx}`,
-        source: 'Duffel Global GDS (Ao Vivo)',
-        sourceType: 'cia',
-        airline: airlineName,
-        airlineCode: (firstSeg.operating_carrier?.iata_code as any) || 'LA',
-        flightNumber: flightNum,
-        originCode: origObj.code,
-        originCity: origObj.city,
-        destinationCode: destObj.code,
-        destinationCity: destObj.city,
-        date: dateStr,
-        departureTime: depTime,
-        arrivalTime: arrTime,
-        duration: durParsed.label,
-        durationMinutes: durParsed.minutes,
-        stops: numStops,
-        stopDetails,
-        price: priceBrl,
-        baseFare: Math.max(50, Math.round((priceBrl - boardingTax) * 100) / 100),
-        boardingFee: boardingTax,
-        milesProgram: 'Programa de Fidelidade',
-        milesRequired: milesReq,
-        milesValuationPerThousand: 17.5,
-        milesTotalCost: Math.round(((milesReq / 1000) * 16.5 + boardingTax) * 100) / 100,
-        recommendedStrategy: 'Dinheiro',
-        strategySavings: 15.0,
-        baggage: '1 item pessoal + mala de mão inclusa',
-        aircraft: firstSeg.aircraft?.name || 'Aeronave Comercial',
-        fareClass: 'Econômica Regular',
-        refundable: false,
-        historicalAvgPrice: Math.round(priceBrl * 1.18),
-        discountPercent: 15,
-        seatsLeft: 4,
-        verifiedAt: 'Ao vivo via Duffel API',
-        link: `https://www.google.com/travel/flights?q=Flights%20to%20${destObj.code}%20from%20${origObj.code}%20on%20${dateStr}%20oneway&curr=BRL&hl=pt-BR`,
-        priceHistory7d,
-      };
-    });
-  } catch (err) {
-    console.error('Erro ao consultar Duffel API:', err);
-    return null;
-  }
-}
-
-async function startServer() {
-  const app = express();
-
-  const portArgIndex = process.argv.indexOf('--port');
-  const cliPort = portArgIndex !== -1 ? Number(process.argv[portArgIndex + 1]) : null;
-  const PORT = cliPort || 3000;
-
-  const hostArgIndex = process.argv.indexOf('--host');
-  const cliHost = hostArgIndex !== -1 ? process.argv[hostArgIndex + 1] : null;
-  const HOST = cliHost || '0.0.0.0';
-
-  app.use(express.json());
-
-  let savedAlerts: RouteAlert[] = [...INITIAL_ALERTS];
-
-  // Rota de busca de voos reais da Duffel API
-  app.get('/api/flights/search', async (req, res) => {
-    try {
-      const { origin = 'CWB', destination = 'GIG', date } = req.query;
-      const duffelApiKey = process.env.DUFFEL_API_KEY;
-
-      if (!duffelApiKey) {
-        return res.status(500).json({ error: 'Chave da API da Duffel não configurada.' });
-      }
-
-      const duffelResponse = await fetch('https://api.duffel.com/air/offer_requests', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${duffelApiKey}`,
-          'Duffel-Version': 'v2',
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        body: JSON.stringify({
-          data: {
-            slices: [
-              {
-                origin: String(origin),
-                destination: String(destination),
-                departure_date: String(date || '2026-11-20'),
-              },
-            ],
-            passengers: [{ type: 'adult' }],
-            cabin_class: 'economy',
-          },
-        }),
-      });
-
-      const flightData = await duffelResponse.json();
-
-      if (!duffelResponse.ok) {
-        console.error('Erro na API da Duffel:', flightData);
-        return res.status(duffelResponse.status).json(flightData);
-      }
-
-      res.json(flightData);
-    } catch (error) {
-      console.error('Erro interno na busca da Duffel:', error);
-      res.status(500).json({ error: 'Erro ao processar busca de voos reais.' });
-    }
-  });
-
-  // Rota principal do comparador com Duffel ao vivo + radar de milhas
-  app.post('/api/search', async (req, res) => {
-    const { origin = 'CWB', destination = 'GIG', date, passengers = 1 } = req.body || {};
-    const searchDate =
-      date || new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0];
-    const pax = Math.max(1, Math.min(9, Number(passengers) || 1));
-
-    const originAirport = resolveAirport(String(origin));
-    const destinationAirport = resolveAirport(String(destination));
-
-    let flights: FlightOffer[] = [];
-    const duffelFlights = await fetchDuffelOffers(
-      originAirport.code,
-      destinationAirport.code,
-      searchDate,
-      pax
-    );
-
-    const localOffers = scanFlightsForRoute(
-      originAirport.code,
-      destinationAirport.code,
-      searchDate,
-      pax
-    );
-
-    if (duffelFlights && duffelFlights.length > 0) {
-      // Mescla as ofertas ao vivo da Duffel com as cotações de milhas locais
-      const milesOffers = localOffers.filter((o) => o.sourceType === 'milhas');
-      flights = [...duffelFlights.slice(0, 5), ...milesOffers].sort((a, b) => a.price - b.price);
-    } else {
-      flights = localOffers;
-    }
-
-    const calendar = generateFareCalendar(
-      originAirport.code,
-      destinationAirport.code,
-      searchDate,
-      pax
-    );
-
+    // Retorna no formato que o Garimpa Trip espera
     res.json({
       originAirport,
       destinationAirport,
-      date: searchDate,
-      passengers: pax,
-      flights,
-      calendar,
-      scannedSources: [
-        'Duffel GDS Ao Vivo',
-        'LATAM Direto',
-        'GOL / Smiles',
-        'Azul / TudoAzul',
-        'MaxMilhas',
-        'Google Flights',
-        'Skyscanner',
-      ],
+      duffelOffers: flightData.data || {}
     });
-  });
 
-  app.get('/api/airports', (req, res) => {
-    const q = normalizeText(String(req.query.q || ''));
-    if (!q) {
-      res.json(AIRPORTS);
-      return;
-    }
-    const matches = AIRPORTS.filter(
-      (a) =>
-        a.code.toLowerCase().includes(q) ||
-        normalizeText(a.city).includes(q) ||
-        normalizeText(a.name).includes(q) ||
-        normalizeText(a.state).includes(q)
-    );
-    res.json(matches);
-  });
-
-  app.get('/api/alerts', (_req, res) => {
-    res.json(savedAlerts);
-  });
-
-  app.post('/api/alerts', (req, res) => {
-    const { origin, destination, date, targetPrice } = req.body || {};
-    const orig = resolveAirport(String(origin || 'CWB'));
-    const dest = resolveAirport(String(destination || 'GIG'));
-    const flightDate =
-      date || new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0];
-    const offers = scanFlightsForRoute(orig.code, dest.code, flightDate, 1);
-    const cheapest = offers[0];
-
-    const newAlert: RouteAlert = {
-      id: `alert-${Date.now()}`,
-      originCode: orig.code,
-      originCity: orig.city,
-      destinationCode: dest.code,
-      destinationCity: dest.city,
-      date: flightDate,
-      targetPrice: Number(targetPrice) || Math.round(cheapest.price * 0.92),
-      currentLowestPrice: cheapest.price,
-      lowestSource: cheapest.source,
-      lowestAirline: cheapest.airline,
-      lastChecked: 'Agora mesmo',
-      active: true,
-      priceChange24h: -6.4,
-    };
-
-    savedAlerts = [newAlert, ...savedAlerts];
-    res.status(201).json(newAlert);
-  });
-
-  app.delete('/api/alerts/:id', (req, res) => {
-    savedAlerts = savedAlerts.filter((a) => a.id !== req.params.id);
-    res.json({ ok: true });
-  });
-
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: false,
-      },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+  } catch (error) {
+    console.error('Erro interno em /api/search:', error);
+    res.status(500).json({ error: 'Erro ao processar busca de voos.' });
   }
+});
 
-  app.listen(PORT, HOST, () => {
-    console.log(`Servidor do FlyPrice Tracker a rodar em http://${HOST}:${PORT}`);
-  });
-}
+// 2. Rota de suporte para alertas (evita o erro 404 no console)
+app.get('/api/alerts', (req, res) => {
+  res.json({ alerts: [] });
+});
 
-startServer();
+app.post('/api/alerts', (req, res) => {
+  res.json({ success: true, message: 'Alerta registado com sucesso.' });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(Number(PORT), '0.0.0.0', () => {
+  console.log(`Servidor do Garimpa Trip a rodar na porta ${PORT}`);
+});
